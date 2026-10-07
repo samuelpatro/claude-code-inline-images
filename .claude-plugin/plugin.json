@@ -1,0 +1,10 @@
+{
+  "name": "inline-images",
+  "version": "0.1.0",
+  "description": "Shows images inline in the Claude Code terminal: pasted images under your prompt and above the prompt box, and the images Claude reads, writes or screenshots under their tool call.",
+  "author": { "name": "Samuel Patro" },
+  "homepage": "https://github.com/samuelpatro/claude-code-inline-images",
+  "repository": "https://github.com/samuelpatro/claude-code-inline-images",
+  "license": "MIT",
+  "keywords": ["mod", "images", "screenshots", "kitty-graphics", "ghostty", "cmux"]
+}
