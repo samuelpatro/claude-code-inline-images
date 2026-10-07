@@ -22,8 +22,9 @@ const SINGLE: Cells = { columns: 32, rows: 8 }
 const MULTI: Cells = { columns: 22, rows: 6 }
 const PREVIEW: Cells = { columns: 18, rows: 5 }
 const GAP = 2
-// The narrowest caption: room for a size and the Open button.
-const MIN_TILE = 18
+// The narrowest card inside its border: room for a size and the open button.
+const MIN_TILE = 22
+const PREVIEW_TILE = 12
 const MAX_IMAGES = 6
 const POLL_MS = 500
 const SEARCH_MS = 5000
@@ -66,12 +67,9 @@ export const register: Register = on => {
     const limit = { columns: PREVIEW.columns, rows: Math.max(2, Math.min(PREVIEW.rows, e.props.maxRows - 3)) }
     return (
       <els.Box flexDirection="row" columnGap={GAP} paddingLeft={2}>
-        {shown.map((item, i) => (
-          <els.Box key={`draft-${i}`} flexDirection="column">
-            {framed(els, item, cellsOf(item.picture, limit), `draft-${i}`)}
-            <els.Text dimColor>{item.label}</els.Text>
-          </els.Box>
-        ))}
+        {shown.map((item, i) =>
+          card(els, item, cellsOf(item.picture, limit), { columns: Math.max(PREVIEW_TILE, limit.columns), rows: limit.rows }, `draft-${i}`),
+        )}
       </els.Box>
     )
   })
@@ -125,22 +123,73 @@ function actionsOf($: EngineInterface): Actions {
   return { open: path => void openFile($, path, false) }
 }
 
-/** A picture in a thin dim frame, with a clear click layer laid over it. */
-function framed(els: ElementTable<'terminal'>, item: Shown, box: Cells, key: string): RenderElement {
-  const { Box, Client, Image } = els
+/**
+ * A picture as a card drawn with box-drawing characters: its name in the top
+ * border, its size and an open button in the bottom one. The picture sits
+ * centered in an area of `inner` cells, under a clear click layer.
+ */
+function card(els: ElementTable<'terminal'>, item: Shown, box: Cells, inner: Cells, key: string, actions?: Actions): RenderElement {
+  const { Box, Button, Client, Image, Text } = els
+  const width = inner.columns + 2
+  const title = clip(item.label, inner.columns - 3)
+  const size = `${item.picture.width}×${item.picture.height}`
+  // The bottom border: ╰─ size ─…─ ↗ ─╯, the size left out when it does not fit.
+  const sizeText = actions && size.length + 10 <= width ? ` ${size} ` : ''
+  const tail = actions ? 5 : 1
+  const fill = Math.max(0, width - 2 - sizeText.length - tail)
+  const side = Array.from({ length: inner.rows }, (_, i) => (
+    <Text key={`side-${i}`} dimColor>
+      │
+    </Text>
+  ))
   return (
-    <Box key={`frame-${key}`} borderStyle="round" borderDimColor width={box.columns + 2} height={box.rows + 2}>
-      <Image source={{ file: item.picture.thumb, format: 'png' }} alt={`[${item.label}]`} {...box} />
-      <Box position="absolute" top={0} left={0}>
-        <Client key={`hit-${key}`} module="./click.ts" width={box.columns} height={box.rows} props={{ path: item.picture.path }} />
+    <Box key={`card-${key}`} flexDirection="column" width={width}>
+      <Box>
+        <Text dimColor>╭─</Text>
+        <Text>{` ${title} `}</Text>
+        <Text dimColor>{`${'─'.repeat(Math.max(0, width - 5 - title.length))}╮`}</Text>
+      </Box>
+      <Box>
+        <Box flexDirection="column">{side}</Box>
+        <Box width={inner.columns} height={inner.rows} justifyContent="center" alignItems="center">
+          <Box width={box.columns} height={box.rows}>
+            <Image source={{ file: item.picture.thumb, format: 'png' }} alt={`[${item.label}]`} {...box} />
+            <Box position="absolute" top={0} left={0}>
+              <Client key={`hit-${key}`} module="./click.ts" width={box.columns} height={box.rows} props={{ path: item.picture.path }} />
+            </Box>
+          </Box>
+        </Box>
+        <Box flexDirection="column">{side}</Box>
+      </Box>
+      <Box>
+        <Text dimColor>{`╰─${sizeText}${'─'.repeat(fill)}`}</Text>
+        {actions && (
+          <Button
+            key={`open-${key}`}
+            label=" ↗ "
+            plain
+            dimColor
+            hover={{ dimColor: false }}
+            onPress={() => actions.open(item.picture.path)}
+          />
+        )}
+        <Text dimColor>{actions ? '─╯' : '╯'}</Text>
       </Box>
     </Box>
   )
 }
 
+/** Shortens text in the middle to fit `width` cells. */
+function clip(text: string, width: number): string {
+  if (text.length <= width) return text
+  if (width <= 1) return text.slice(0, Math.max(0, width))
+  const head = Math.ceil((width - 1) / 2)
+  return `${text.slice(0, head)}…${text.slice(text.length - (width - 1 - head))}`
+}
+
 /**
- * The row with its pictures under it, side by side in tiles of one width:
- * each picture framed, its name, then its size and an Open button.
+ * The row with its pictures under it as cards, side by side. Several cards
+ * share one size, the picture centered in each, so the row reads as a grid.
  */
 function gallery(
   els: ElementTable<'terminal'>,
@@ -150,7 +199,7 @@ function gallery(
   actions: Actions,
 ): RenderElement {
   if (shown.length === 0) return row
-  const { Box, Button, Text } = els
+  const { Box, Text } = els
   const width = (viewportColumns ?? 100) - 4
   const visible = shown.slice(0, MAX_IMAGES)
   const isSingle = visible.length === 1
@@ -162,19 +211,8 @@ function gallery(
       <Box flexDirection="row" flexWrap="wrap" columnGap={GAP} rowGap={1} marginLeft={2} marginTop={1}>
         {visible.map((item, i) => {
           const box = cellsOf(item.picture, fit)
-          const tile = Math.max(MIN_TILE, (isSingle ? box.columns : fit.columns) + 2)
-          return (
-            <Box key={`image-${i}`} flexDirection="column" width={tile}>
-              <Box width={tile} height={(isSingle ? box.rows : fit.rows) + 2} alignItems="flex-end">
-                {framed(els, item, box, `image-${i}`)}
-              </Box>
-              <Text dimColor wrap="truncate-middle">{item.label}</Text>
-              <Box columnGap={2}>
-                <Text dimColor>{`${item.picture.width}×${item.picture.height}`}</Text>
-                <Button key={`open-${i}`} label="Open" plain dimColor onPress={() => actions.open(item.picture.path)} />
-              </Box>
-            </Box>
-          )
+          const inner = isSingle ? { columns: Math.max(MIN_TILE, box.columns), rows: box.rows } : fit
+          return card(els, item, box, inner, `image-${i}`, actions)
         })}
         {shown.length > visible.length && <Text dimColor>{`+${shown.length - visible.length}`}</Text>}
       </Box>
