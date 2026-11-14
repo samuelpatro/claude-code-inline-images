@@ -5,6 +5,8 @@ const FOLDER = '/private/tmp/claude-501/-Users-x/s1/images'
 
 /** Answers the engine calls the mod makes: files, sips and the paste folder. */
 function machine(on: On, runs: Args<'process.run'>[] = []) {
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('ui.invalidate', () => ({ value: undefined }))
   on('session.id', () => ({ value: 's1' }))
   on('fs.list', ($, e) => ({
@@ -14,14 +16,18 @@ function machine(on: On, runs: Args<'process.run'>[] = []) {
   on('fs.stat', () => ({ value: { kind: 'file', size: 1000, mtimeMs: 1, isLink: false } }))
   on('process.run', ($, e) => {
     runs.push(e)
-    const stdout =
-      e.argv[0] === '/usr/bin/id' ? '501\n' : e.argv.includes('-g') ? '  pixelWidth: 1200\n  pixelHeight: 800\n' : '/var/x/\n'
+    // `sips -g pixelWidth -g pixelHeight <files>` answers one block per file.
+    const sizes = e.argv.slice(5).map(file => `${file}\n  pixelWidth: 1200\n  pixelHeight: 800\n`).join('')
+    const stdout = e.argv[0] === '/usr/bin/id' ? '501\n' : e.argv.includes('-g') ? sizes : '/var/x/\n'
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
 }
 
+const START = { cwd: '/Users/x', surface: 'terminal', isInteractive: true } as const
+
 test('a pasted image draws framed under the prompt, from a small thumbnail', async ($, on) => {
-  const clock = mock.clock(on)
+  // Past the paste-folder search interval, so the first poll looks for it.
+  const clock = mock.clock(on, { now: 10_000 })
   const runs: Args<'process.run'>[] = []
   const ROW: RenderElement = { type: 'Text', children: ['> [Image #2] look'] }
   on('ui.render', { component: 'UserMessage' }, () => ROW)
@@ -34,8 +40,13 @@ test('a pasted image draws framed under the prompt, from a small thumbnail', asy
     props: { text: '[Image #2] look', origin: { kind: 'composer' }, isExpanded: false },
   } as RenderInput<'UserMessage'>
 
-  expect(await $.ui.render(input)).toEqual(ROW)
-  await clock.settle()
+  await $.session.start(START)
+  expect(await $.ui.render(input)).toMatchObject(ROW)
+  // The timer finds the paste folder and asks for a redraw, which queues the
+  // picture for the next tick.
+  await clock.advance(500)
+  expect(await $.ui.render(input)).toMatchObject(ROW)
+  await clock.advance(500)
   const drawn = JSON.stringify(await $.ui.render(input))
   expect(drawn).toContain('/private/tmp/inline-images-cache/')
   expect(drawn).toContain("╭─")
@@ -46,9 +57,10 @@ test('a pasted image draws framed under the prompt, from a small thumbnail', asy
 
 test('an image file shows under the first tool row that names it, not again', async ($, on) => {
   const clock = mock.clock(on)
+  const runs: Args<'process.run'>[] = []
   const TOOL_ROW: RenderElement = { type: 'Text', children: ['Read(shot.png)'] }
   on('ui.render', { component: 'ToolUse' }, () => TOOL_ROW)
-  machine(on)
+  machine(on, runs)
   const rowOf = (requestId: string) =>
     ({
       component: 'ToolUse',
@@ -58,10 +70,41 @@ test('an image file shows under the first tool row that names it, not again', as
       props: { tool_use_id: requestId, tool: 'Read', input: { file_path: '/tmp/x/shot.png' }, isRunning: false, isErrored: false, isInterrupted: false },
     }) as RenderInput<'ToolUse'>
 
-  expect(await $.ui.render(rowOf('toolu_1'))).toEqual(TOOL_ROW)
+  await $.session.start(START)
+  expect(await $.ui.render(rowOf('toolu_1'))).toMatchObject(TOOL_ROW)
+  // A draw only queues the picture: no process runs in its dispatch, which a
+  // redraw or an interrupt would abort.
   await clock.settle()
+  expect(runs).toEqual([])
+  await clock.advance(500)
   const first = JSON.stringify(await $.ui.render(rowOf('toolu_1')))
   expect(first).toContain('"path":"/tmp/x/shot.png"')
   expect(first).toContain(" shot.png ")
-  expect(await $.ui.render(rowOf('toolu_2'))).toEqual(TOOL_ROW)
+  expect(await $.ui.render(rowOf('toolu_2'))).toMatchObject(TOOL_ROW)
+
+  // After a /clear the next conversation shows the image again.
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as Args<'session.end'>)
+  expect(JSON.stringify(await $.ui.render(rowOf('toolu_2')))).toContain('"path":"/tmp/x/shot.png"')
+})
+
+test('several images in one tool call are sized by a single sips run', async ($, on) => {
+  const clock = mock.clock(on)
+  const runs: Args<'process.run'>[] = []
+  on('ui.render', { component: 'ToolUse' }, () => ({ type: 'Text', children: ['Bash(compare)'] }))
+  machine(on, runs)
+  const input = {
+    component: 'ToolUse',
+    surface: 'terminal',
+    requestId: 'toolu_3',
+    viewport: { columns: 120, rows: 40, isFullscreen: true },
+    props: { tool_use_id: 'toolu_3', tool: 'Bash', input: { command: 'compare /tmp/y/a.png /tmp/y/b.jpg /tmp/y/c.webp' }, isRunning: false, isErrored: false, isInterrupted: false },
+  } as RenderInput<'ToolUse'>
+
+  await $.session.start(START)
+  await $.ui.render(input)
+  await clock.advance(500)
+  const drawn = JSON.stringify(await $.ui.render(input))
+  for (const name of ['a.png', 'b.jpg', 'c.webp']) expect(drawn).toContain(`"path":"/tmp/y/${name}"`)
+  expect(runs.filter(run => run.argv.includes('-g')).length).toBe(1)
+  expect(runs.filter(run => run.argv.includes('-Z')).length).toBe(3)
 })

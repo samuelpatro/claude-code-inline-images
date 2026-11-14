@@ -27,18 +27,37 @@ const MIN_TILE = 22
 const PREVIEW_TILE = 12
 const MAX_IMAGES = 6
 const POLL_MS = 500
+// How often the paste folder is looked for until it exists: at its expected
+// place, and less often anywhere under the paste roots.
 const SEARCH_MS = 5000
+const SCAN_MS = 30000
+// Thumbnails made at once.
+const LOAD_BATCH = 4
 
 // Pictures by image path, or null when the file is gone or cannot be drawn.
 // Module state: a reload of the mod starts it over.
 const pictures = new Map<string, Picture | null>()
 const loading = new Set<string>()
+// Paths a draw asked for. A render's `$` calls end with its dispatch (a redraw
+// or an interrupt aborts them), so draws only queue paths and the poll timer
+// loads them.
+const wanted = new Set<string>()
+let isPolling = false
 // This session's paste folder, the image numbers in the prompt box, and the
 // highest number already sent (-1 until the first check).
 let pasteFolder = ''
 let draft: number[] = []
 let maxSent = -1
 let lastSearch = 0
+let lastScan = Number.NEGATIVE_INFINITY
+let sessionCwd = ''
+// The folders Claude Code keeps pastes under: the same for the whole session.
+let pasteRoots: string[] | undefined
+// The thumbnail folder, made once.
+let cacheReady: Promise<unknown> | undefined
+// The image paths each tool row names. A draw scans a row's input again only
+// when its text grew, not on every redraw.
+const namedByRow = new Map<string, { size: number; paths: string[] }>()
 // The first tool row that named each image file: later rows naming it again
 // (a screenshot, then a Read of it) show nothing more.
 const firstRow = new Map<string, string>()
@@ -46,11 +65,29 @@ const firstRow = new Map<string, string>()
 export const register: Register = on => {
   // Pasted images not sent yet show above the prompt box. Claude Code saves a
   // paste at once, and mods do not hear prompt-box edits in every session, so
-  // the paste folder is checked on a timer.
+  // the paste folder is checked on a timer. The timer also loads the pictures
+  // draws asked for.
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+    sessionCwd = e.cwd
     $.clock.every(POLL_MS, () => void poll($))
     return result
+  })
+
+  // A `/clear` or a resume goes on under a new session id, with no
+  // `session.start`: the next conversation has its own paste folder, and an
+  // image it names shows again under its own row.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      firstRow.clear()
+      namedByRow.clear()
+      pasteFolder = ''
+      draft = []
+      maxSent = -1
+      lastSearch = 0
+      lastScan = Number.NEGATIVE_INFINITY
+    }
+    return next(e)
   })
 
   on('prompt.submit', async ($, e, next) => {
@@ -65,26 +102,30 @@ export const register: Register = on => {
     if (e.surface !== 'terminal' || e.props.hasSurvey || shown.length === 0) return next(e)
     const els = $.ui.resolve(e)
     const limit = { columns: PREVIEW.columns, rows: Math.max(2, Math.min(PREVIEW.rows, e.props.maxRows - 3)) }
+    const inner = { columns: Math.max(PREVIEW_TILE, limit.columns), rows: limit.rows }
+    // As many cards as the band's width holds, the rest counted.
+    const fits = Math.max(1, Math.floor((e.props.bodyColumns - 2 - 3 + GAP) / (inner.columns + 2 + GAP)))
+    const visible = shown.slice(0, fits)
     return (
       <els.Box flexDirection="row" columnGap={GAP} paddingLeft={2}>
-        {shown.map((item, i) =>
-          card(els, item, cellsOf(item.picture, limit), { columns: Math.max(PREVIEW_TILE, limit.columns), rows: limit.rows }, `draft-${i}`),
-        )}
+        {visible.map((item, i) => card(els, item, cellsOf(item.picture, limit), inner, `draft-${i}`))}
+        {shown.length > visible.length && <els.Text dimColor>{`+${shown.length - visible.length}`}</els.Text>}
       </els.Box>
     )
   })
 
-  // Your prompt rows: the pasted pictures under the text.
+  // Your prompt rows: the pasted pictures under the text. A notification or
+  // another agent's message names no paste of yours.
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     const row = await next(e)
-    if (e.surface !== 'terminal') return row
+    if (e.surface !== 'terminal' || e.props.task || e.props.from) return row
     const markers = markersOf(e.props.text)
     if (markers.length === 0) return row
     markSent($, markers)
-    const folder = pasteFolder || (await pasteFolderOf($))
+    // The poll timer finds the folder and redraws.
+    const folder = pasteFolder
     if (!folder) return row
-    const paths = markers.map(n => `${folder}/${n}.png`)
-    request($, paths)
+    request(markers.map(n => `${folder}/${n}.png`))
     const shown = markers.flatMap(n => shownOf(`${folder}/${n}.png`, `#${n}`))
     return gallery($.ui.resolve(e), row, shown, e.viewport?.columns, actionsOf($))
   })
@@ -94,7 +135,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
     const row = await next(e)
     if (e.surface !== 'terminal' || e.props.isRunning) return row
-    const shown = toolImages($, [e.props.input], e.requestId)
+    const shown = toolImages([e.props.input], e.requestId)
     return gallery($.ui.resolve(e), row, shown, e.viewport?.columns, actionsOf($))
   })
 
@@ -102,16 +143,15 @@ export const register: Register = on => {
   on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
     const row = await next(e)
     if (e.surface !== 'terminal' || e.props.isExpanded || e.props.isActive) return row
-    const shown = toolImages($, e.props.calls.map(call => call.input), e.requestId)
+    const shown = toolImages(e.props.calls.map(call => call.input), e.requestId)
     return gallery($.ui.resolve(e), row, shown, e.viewport?.columns, actionsOf($))
   })
 
   // A click on a picture opens it in a cmux preview tab.
-  on('ui.message', async ($, e) => {
+  on('ui.message', async ($, e, next) => {
     const path = (e.data as { path?: unknown } | undefined)?.path
-    if (typeof e.element === 'string' && e.element.startsWith('hit-') && typeof path === 'string') {
-      void openFile($, path, true)
-    }
+    if (!e.element.startsWith('hit-') || typeof path !== 'string') return next(e)
+    void openFile($, path, true)
     return {}
   })
 }
@@ -226,11 +266,17 @@ function shownOf(path: string, label: string): Shown[] {
 }
 
 /** The image files named anywhere in these tool inputs, as far as they are loaded. */
-function toolImages($: EngineInterface, inputs: unknown[], requestId: string): Shown[] {
-  const named = [...new Set(inputs.flatMap(input => stringsIn(input).flatMap(text => text.match(IMAGE_PATH) ?? [])))]
-  for (const path of named) if (!firstRow.has(path)) firstRow.set(path, requestId)
-  const paths = named.filter(path => firstRow.get(path) === requestId)
-  request($, paths)
+function toolImages(inputs: unknown[], requestId: string): Shown[] {
+  const texts = inputs.flatMap(stringsIn)
+  const size = texts.reduce((sum, text) => sum + text.length, 0)
+  let named = namedByRow.get(requestId)
+  if (named?.size !== size) {
+    named = { size, paths: [...new Set(texts.flatMap(text => text.match(IMAGE_PATH) ?? []))] }
+    namedByRow.set(requestId, named)
+    for (const path of named.paths) if (!firstRow.has(path)) firstRow.set(path, requestId)
+  }
+  const paths = named.paths.filter(path => firstRow.get(path) === requestId)
+  request(paths)
   return paths.flatMap(path => shownOf(path, path.slice(path.lastIndexOf('/') + 1)))
 }
 
@@ -245,54 +291,84 @@ function markersOf(text: string): number[] {
   return [...new Set([...text.matchAll(MARKER)].map(match => Number(match[1])))]
 }
 
-/** Loads the pictures not known yet, then redraws. */
-function request($: EngineInterface, paths: string[]): void {
-  const missing = paths.filter(path => !pictures.has(path) && !loading.has(path))
-  if (missing.length > 0) void loadPictures($, missing)
+/** Queues the pictures not known yet for the poll timer to load. */
+function request(paths: string[]): void {
+  for (const path of paths) if (!pictures.has(path) && !loading.has(path)) wanted.add(path)
 }
 
+/** Loads the pictures not known yet, a few at a time, then redraws. */
 async function loadPictures($: EngineInterface, paths: string[]): Promise<void> {
+  const fresh = paths.filter(path => !pictures.has(path) && !loading.has(path))
+  if (fresh.length === 0) return
+  for (const path of fresh) loading.add(path)
   let isChanged = false
-  for (const path of paths) {
-    if (pictures.has(path) || loading.has(path)) continue
-    loading.add(path)
-    try {
-      const picture = await pictureOf($, path)
+  try {
+    const stats = await Promise.all(fresh.map(path => $.fs.stat(path).catch(() => undefined)))
+    const files = fresh.flatMap((path, i) => {
+      const stat = stats[i]
+      return stat?.kind === 'file' && stat.size > 0 ? [{ path, mtimeMs: stat.mtimeMs }] : []
+    })
+    const sizes = await sizesOf($, files.map(file => file.path))
+    const made = new Map<string, Picture | null>()
+    for (let start = 0; start < files.length; start += LOAD_BATCH) {
+      await Promise.all(
+        files.slice(start, start + LOAD_BATCH).map(async (file, i) => {
+          const size = sizes[start + i]
+          made.set(file.path, size ? await pictureOf($, file.path, file.mtimeMs, size).catch(() => null) : null)
+        }),
+      )
+    }
+    for (const path of fresh) {
+      const picture = made.get(path) ?? null
       // A paste not written yet is looked for again on the next draw.
       if (picture || !path.includes('/images/')) pictures.set(path, picture)
       isChanged = isChanged || picture !== null
-    } catch (error) {
-      pictures.set(path, null)
-      $.ui.log(`inline-images: ${String(error)}`, { to: 'debug' })
-    } finally {
-      loading.delete(path)
     }
+  } catch (error) {
+    for (const path of fresh) if (!pictures.has(path)) pictures.set(path, null)
+    $.ui.log(`inline-images: ${String(error)}`, { to: 'debug' })
+  } finally {
+    for (const path of fresh) loading.delete(path)
   }
   if (isChanged) $.ui.invalidate('ui.render')
 }
 
-/** The image's size and a small PNG copy to draw, made once with macOS `sips`. */
-async function pictureOf($: EngineInterface, path: string): Promise<Picture | null> {
-  const stat = await $.fs.stat(path).catch(() => undefined)
-  if (stat?.kind !== 'file' || stat.size === 0) return null
-  const size = await sizeOf($, path)
-  if (!size) return null
-  const isSmallPng = /\.png$/i.test(path) && Math.max(size.width, size.height) <= THUMB_PX
-  if (isSmallPng) return { path, thumb: path, ...size }
-  const thumb = `${CACHE}/${hashOf(`${path}:${stat.mtimeMs}`)}.png`
+type Size = { width: number; height: number }
+
+/** The small PNG copy to draw for an image, made once with macOS `sips`. */
+async function pictureOf($: EngineInterface, path: string, mtimeMs: number, size: Size): Promise<Picture | null> {
+  const longSide = Math.max(size.width, size.height)
+  if (/\.png$/i.test(path) && longSide <= THUMB_PX) return { path, thumb: path, ...size }
+  const thumb = `${CACHE}/${hashOf(`${path}:${mtimeMs}`)}.png`
   if (!(await $.fs.exists(thumb))) {
-    await $.process.run(['/bin/mkdir', '-p', CACHE])
-    const made = await $.process.run(['/usr/bin/sips', '-s', 'format', 'png', '-Z', String(THUMB_PX), path, '--out', thumb])
-    if (made.exitCode !== 0) return null
+    cacheReady ??= $.process.run(['/bin/mkdir', '-p', CACHE])
+    await cacheReady
+    // `sips -Z` also scales up, so a small image keeps its own size.
+    const made = await $.process.run(['/usr/bin/sips', '-s', 'format', 'png', '-Z', String(Math.min(THUMB_PX, longSide)), path, '--out', thumb])
+    if (made.exitCode !== 0) {
+      cacheReady = undefined // the folder may have been cleaned away
+      return null
+    }
   }
   return { path, thumb, ...size }
 }
 
-async function sizeOf($: EngineInterface, file: string): Promise<{ width: number; height: number } | undefined> {
-  const { exitCode, stdout } = await $.process.run(['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', file])
-  const width = Number(/pixelWidth: (\d+)/.exec(stdout)?.[1])
-  const height = Number(/pixelHeight: (\d+)/.exec(stdout)?.[1])
-  return exitCode === 0 && width > 0 && height > 0 ? { width, height } : undefined
+/** The pixel sizes of these image files, from one `sips` run; undefined for a file it cannot read. */
+async function sizesOf($: EngineInterface, files: string[]): Promise<(Size | undefined)[]> {
+  if (files.length === 0) return []
+  const { exitCode, stdout } = await $.process.run(['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', ...files])
+  const found = [...stdout.matchAll(/pixelWidth: (\S+)\s+pixelHeight: (\S+)/g)]
+  if (exitCode !== 0 || found.length !== files.length) {
+    // `sips` leaves out a file that went missing, so the answers no longer
+    // line up with the files: ask for each on its own.
+    if (files.length === 1) return [undefined]
+    return Promise.all(files.map(async file => (await sizesOf($, [file]))[0]))
+  }
+  return found.map(match => {
+    const width = Number(match[1])
+    const height = Number(match[2])
+    return width > 0 && height > 0 ? { width, height } : undefined
+  })
 }
 
 function hashOf(text: string): string {
@@ -312,15 +388,14 @@ function hashOf(text: string): string {
  */
 async function openFile($: EngineInterface, path: string, inCmux: boolean): Promise<void> {
   try {
-    const workspace = inCmux ? await $.env.get('CMUX_WORKSPACE_ID') : undefined
-    const surface = inCmux ? await $.env.get('CMUX_SURFACE_ID') : undefined
-    const hasCmux = workspace !== undefined && surface !== undefined && (await $.fs.exists(CMUX))
-    if (!hasCmux) {
+    const clicked = inCmux ? await clickedPane($) : undefined
+    if (!clicked) {
       const { exitCode, stderr } = await $.process.run(['/usr/bin/open', path])
       if (exitCode !== 0) $.ui.toast(`Could not open ${path.slice(path.lastIndexOf('/') + 1)}: ${stderr.trim()}`)
       return
     }
-    const pane = await otherPane($, workspace, surface)
+    const { workspace } = clicked
+    const pane = await otherPane($, workspace, clicked.pane)
     const { exitCode, stderr } = pane
       ? await $.process.run([CMUX, 'open', path, '--workspace', workspace, '--pane', pane, '--focus', 'false'])
       : await $.process.run([CMUX, 'new-pane', '--type', 'browser', '--direction', 'right', '--workspace', workspace, '--url', `file://${path}`, '--focus', 'false'])
@@ -330,16 +405,27 @@ async function openFile($: EngineInterface, path: string, inCmux: boolean): Prom
   }
 }
 
-/** A pane of the workspace other than the one Claude runs in, docks left out. */
-async function otherPane($: EngineInterface, workspace: string, surface: string): Promise<string | undefined> {
+/**
+ * Where the click landed: cmux's focused workspace and pane, asked at click
+ * time. The CMUX_WORKSPACE_ID this process started with goes stale when its
+ * tab moves to another workspace or the session is attached from elsewhere.
+ */
+async function clickedPane($: EngineInterface): Promise<{ workspace: string; pane: string } | undefined> {
+  if ((await $.env.get('CMUX_SURFACE_ID')) === undefined || !(await $.fs.exists(CMUX))) return undefined
+  const { exitCode, stdout } = await $.process.run([CMUX, 'identify', '--no-caller'])
+  if (exitCode !== 0) return undefined
+  const focused = (JSON.parse(stdout) as { focused?: { workspace_ref?: unknown; pane_ref?: unknown } | null }).focused
+  return typeof focused?.workspace_ref === 'string' && typeof focused.pane_ref === 'string'
+    ? { workspace: focused.workspace_ref, pane: focused.pane_ref }
+    : undefined
+}
+
+/** A pane of the workspace other than the clicked one, docks left out. */
+async function otherPane($: EngineInterface, workspace: string, clicked: string): Promise<string | undefined> {
   const listed = await $.process.run([CMUX, 'list-panes', '--workspace', workspace])
-  const panes = listed.stdout.split('\n').flatMap(line => {
+  for (const line of listed.stdout.split('\n')) {
     const ref = /pane:\d+/.exec(line)?.[0]
-    return ref && !line.includes('[dock') ? [ref] : []
-  })
-  for (const pane of panes) {
-    const surfaces = await $.process.run([CMUX, 'list-pane-surfaces', '--workspace', workspace, '--pane', pane, '--id-format', 'both'])
-    if (!surfaces.stdout.includes(surface)) return pane
+    if (ref && ref !== clicked && !line.includes('[dock')) return ref
   }
   return undefined
 }
@@ -352,19 +438,29 @@ function markSent($: EngineInterface, markers: number[]): void {
   $.ui.invalidate('ui.render')
 }
 
-/** Shows the pasted images newer than the last one sent. */
+/** Loads the pictures draws asked for, and shows the pasted images newer than the last one sent. */
 async function poll($: EngineInterface): Promise<void> {
+  if (isPolling) return
+  isPolling = true
   try {
+    if (wanted.size > 0) {
+      const paths = [...wanted]
+      wanted.clear()
+      await loadPictures($, paths)
+    }
     if (!pasteFolder) {
       const now = await $.clock.now()
       if (now - lastSearch < SEARCH_MS) return
       lastSearch = now
+      pasteFolder = await pasteFolderOf($, now)
+      if (!pasteFolder) {
+        if (maxSent < 0) maxSent = 0 // no folder yet: nothing pasted in this session
+        return
+      }
+      // Prompt rows drawn before the folder was known can show their pictures now.
+      $.ui.invalidate('ui.render')
     }
-    const folder = await pasteFolderOf($)
-    if (!folder) {
-      if (maxSent < 0) maxSent = 0 // no folder yet: nothing pasted in this session
-      return
-    }
+    const folder = pasteFolder
     const numbers = (await $.fs.list(folder)).flatMap(entry => {
       const match = /^(\d+)\.png$/.exec(entry.name)
       return match ? [Number(match[1])] : []
@@ -380,25 +476,41 @@ async function poll($: EngineInterface): Promise<void> {
     $.ui.invalidate('ui.render')
   } catch (error) {
     $.ui.log(`inline-images: ${String(error)}`, { to: 'debug' })
+  } finally {
+    isPolling = false
   }
 }
 
-/** Claude Code keeps pastes in <tmp>/claude-<uid>/<project>/<session>/images. */
-async function pasteFolderOf($: EngineInterface): Promise<string> {
-  if (pasteFolder) return pasteFolder
+/**
+ * Claude Code keeps pastes in <tmp>/claude-<uid>/<project>/<session>/images,
+ * the project named after the working directory. That place is checked first;
+ * every project folder only now and then, for a session started elsewhere.
+ */
+async function pasteFolderOf($: EngineInterface, now: number): Promise<string> {
   const session = await $.session.id()
-  const uid = (await $.process.run(['/usr/bin/id', '-u'])).stdout.trim()
-  const userTmp = (await $.process.run(['/usr/bin/getconf', 'DARWIN_USER_TEMP_DIR'])).stdout.trim().replace(/\/+$/, '')
-  for (const base of [`/private/tmp/claude-${uid}`, `${userTmp}/claude-${uid}`]) {
-    for (const entry of await $.fs.list(base).catch(() => [])) {
-      const candidate = `${base}/${entry.name}/${session}/images`
-      if (entry.kind === 'dir' && (await $.fs.exists(candidate))) {
-        pasteFolder = candidate
-        return pasteFolder
-      }
+  pasteRoots ??= await pasteRootsOf($)
+  const project = sessionCwd.replace(/[^a-zA-Z0-9]/g, '-')
+  if (project) {
+    for (const root of pasteRoots) {
+      const candidate = `${root}/${project}/${session}/images`
+      if (await $.fs.exists(candidate)) return candidate
+    }
+  }
+  if (now - lastScan < SCAN_MS) return ''
+  lastScan = now
+  for (const root of pasteRoots) {
+    for (const entry of await $.fs.list(root).catch(() => [])) {
+      const candidate = `${root}/${entry.name}/${session}/images`
+      if (entry.kind === 'dir' && entry.name !== project && (await $.fs.exists(candidate))) return candidate
     }
   }
   return ''
+}
+
+async function pasteRootsOf($: EngineInterface): Promise<string[]> {
+  const uid = (await $.process.run(['/usr/bin/id', '-u'])).stdout.trim()
+  const userTmp = (await $.process.run(['/usr/bin/getconf', 'DARWIN_USER_TEMP_DIR'])).stdout.trim().replace(/\/+$/, '')
+  return [`/private/tmp/claude-${uid}`, `${userTmp}/claude-${uid}`]
 }
 
 /** The largest box of cells that keeps the picture's shape within the limits. */
