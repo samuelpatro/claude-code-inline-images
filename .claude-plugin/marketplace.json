@@ -6,7 +6,7 @@
     {
       "name": "inline-images",
       "description": "Pasted images under your prompt and above the prompt box, and the images Claude reads, writes or screenshots under their tool call.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": { "name": "Samuel Patro" },
       "source": "./",
       "category": "productivity"

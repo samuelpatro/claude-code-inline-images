@@ -2,11 +2,30 @@
 
 A Claude Code mod that shows images right in the terminal chat.
 
+![Three screenshots Claude read, shown as cards under the tool call](docs/images/tool-images.png)
+
+- **Images Claude works on** (a file it reads or writes, a screenshot a command saves) show under that tool call. A collapsed group like `Read 3 files` shows them side by side.
 - **Pasted images** show under the prompt that carried them, in place of a bare `[Image #N]`.
 - **While you type**, images you pasted but have not sent yet show above the prompt box.
-- **Images Claude works on** (a file it reads or writes, a screenshot a command saves) show under that tool call. A collapsed group like `Read 3 files` shows them side by side.
+- **cmux panels**: click a picture and it opens in the panel beside Claude.
 
-Each picture sits in a thin frame with its name, its size and an **Open** button. Click a picture to open it in the split beside Claude in cmux (a new browser split on the right if there is none). **Open** hands it to your default image app.
+Each picture sits in a thin frame with its name, its size and an open button (`↗`), which hands it to your default image app.
+
+## Demo
+
+A pasted image above the prompt box, before you send it:
+
+![A pasted image previewed above the prompt box](docs/images/paste-preview.png)
+
+The same image under the prompt once it is sent:
+
+![A pasted image shown under the prompt that carried it](docs/images/pasted-image.png)
+
+## cmux panels
+
+In [cmux](https://cmux.com), a click on a picture opens it in the panel beside Claude, without taking focus from the terminal. The mod uses the workspace's other pane, or makes a browser split on the right when there is none, and later clicks reuse it. Outside cmux a click opens the picture in your default image app.
+
+![A screenshot opened in a cmux panel beside Claude](docs/images/cmux-panel.png)
 
 ## Requirements
 
@@ -44,6 +63,8 @@ claude --plugin-dir ./claude-code-inline-images
 - The mod checks that folder twice a second for images newer than the last one you sent, and shows them above the prompt box. Mods do not hear prompt box edits in every session, so a timer is the reliable way.
 - Tool images are found by any image path in a tool call's input (`.png`, `.jpg`, `.gif`, `.webp`, `.heic`, `.tiff`, `.bmp`). An image shows only under the first row that names it.
 - Every picture is drawn from a copy at most 480 px on its long side, made once with `sips` and kept in `/private/tmp/inline-images-cache`. The terminal never has to scale a full-size screenshot while you scroll.
+- Drawing stays cheap: a tool call's input is searched for image paths once, not on every redraw, the images of one tool call are measured in a single `sips` run, and thumbnails are made a few at a time in the background.
+- After `/clear`, an image Claude opens again shows again.
 
 Size limits are the `SINGLE`, `MULTI` and `PREVIEW` values at the top of `hooks/register.tsx`, in terminal cells.
 
