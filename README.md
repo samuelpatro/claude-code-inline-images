@@ -31,6 +31,7 @@ In [cmux](https://cmux.com), a click on a picture opens it in the panel beside C
 
 - Claude Code 2.1.287 or later (mods are on by default)
 - macOS: images are sized and converted with the built-in `sips`
+- Linux: ImageMagick (`identify` and `convert`, HEIC only with its HEIC support installed), and `xdg-open` for the open button
 - A terminal that speaks the kitty graphics protocol: Ghostty, kitty, or cmux
 
 Claude Code only draws pictures in terminals it recognizes by name. In cmux (and other Ghostty-based terminals) turn them on in `~/.claude/settings.json`, then start a new session:
@@ -59,11 +60,11 @@ claude --plugin-dir ./claude-code-inline-images
 
 ## How it works
 
-- Claude Code saves every pasted image as `<tmp>/claude-<uid>/<project>/<session>/images/<n>.png`. The mod reads those files, so pasted images keep their full quality.
+- Claude Code saves every pasted image as `<tmp>/claude-<uid>/<project>/<session>/images/<n>.png` (`<tmp>` is `/private/tmp` on macOS, `CLAUDE_CODE_TMPDIR`, `TMPDIR` or `/tmp` on Linux). The mod reads those files, so pasted images keep their full quality.
 - The mod checks that folder twice a second for images newer than the last one you sent, and shows them above the prompt box. Mods do not hear prompt box edits in every session, so a timer is the reliable way.
 - Tool images are found by any image path in a tool call's input (`.png`, `.jpg`, `.gif`, `.webp`, `.heic`, `.tiff`, `.bmp`). An image shows only under the first row that names it.
-- Every picture is drawn from a copy at most 480 px on its long side, made once with `sips` and kept in `/private/tmp/inline-images-cache`. The terminal never has to scale a full-size screenshot while you scroll.
-- Drawing stays cheap: a tool call's input is searched for image paths once, not on every redraw, the images of one tool call are measured in a single `sips` run, and thumbnails are made a few at a time in the background.
+- Every picture is drawn from a copy at most 480 px on its long side, made once with `sips` (ImageMagick on Linux) and kept in `/private/tmp/inline-images-cache` (`/tmp/inline-images-cache` on Linux). The terminal never has to scale a full-size screenshot while you scroll.
+- Drawing stays cheap: a tool call's input is searched for image paths once, not on every redraw, the images of one tool call are measured in a single `sips` or `identify` run, and thumbnails are made a few at a time in the background.
 - After `/clear`, an image Claude opens again shows again.
 
 Size limits are the `SINGLE`, `MULTI` and `PREVIEW` values at the top of `hooks/register.tsx`, in terminal cells.
