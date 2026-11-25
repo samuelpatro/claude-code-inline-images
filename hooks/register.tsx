@@ -346,7 +346,7 @@ async function pictureOf($: EngineInterface, path: string, mtimeMs: number, size
   const cache = isMac ? MAC_CACHE : LINUX_CACHE
   const thumb = `${cache}/${hashOf(`${path}:${mtimeMs}`)}.png`
   if (!(await $.fs.exists(thumb))) {
-    cacheReady ??= $.process.run(['/bin/mkdir', '-p', cache])
+    cacheReady ??= $.process.run([isMac ? '/bin/mkdir' : 'mkdir', '-p', cache])
     await cacheReady
     // `sips -Z` also scales up, so a small image keeps its own size. `[0]` is
     // the first frame, so an animated GIF makes one PNG and not one per frame.
@@ -404,7 +404,7 @@ async function openFile($: EngineInterface, path: string, inCmux: boolean): Prom
   try {
     const clicked = inCmux ? await clickedPane($) : undefined
     if (!clicked) {
-      const { exitCode, stderr } = await $.process.run([isMac ? '/usr/bin/open' : 'xdg-open', path])
+      const { exitCode, stderr } = isMac ? await $.process.run(['/usr/bin/open', path]) : await xdgOpen($, path)
       if (exitCode !== 0) $.ui.toast(`Could not open ${path.slice(path.lastIndexOf('/') + 1)}: ${stderr.trim()}`)
       return
     }
@@ -417,6 +417,19 @@ async function openFile($: EngineInterface, path: string, inCmux: boolean): Prom
   } catch (error) {
     $.ui.log(`inline-images: ${String(error)}`, { to: 'debug' })
   }
+}
+
+/**
+ * `xdg-open` waits for the viewer in a desktop it does not know (sway,
+ * Hyprland), and `$.process.run` kills it, viewer included, after 30 s. A
+ * spawned child lives until it exits.
+ */
+async function xdgOpen($: EngineInterface, path: string): Promise<{ exitCode: number; stderr: string }> {
+  const child = $.process.spawn({ argv: ['xdg-open', path] })
+  let stderr = ''
+  for await (const piece of child) if (piece.stream === 'stderr') stderr += piece.text
+  const { code } = await child.result
+  return { exitCode: code ?? 1, stderr }
 }
 
 /**
@@ -524,7 +537,7 @@ async function pasteFolderOf($: EngineInterface, now: number): Promise<string> {
 }
 
 async function pasteRootsOf($: EngineInterface): Promise<string[]> {
-  const uid = (await $.process.run(['/usr/bin/id', '-u'])).stdout.trim()
+  const uid = (await $.process.run([isMac ? '/usr/bin/id' : 'id', '-u'])).stdout.trim()
   if (!isMac) {
     // Claude Code nests its folder in CLAUDE_CODE_TMPDIR, else the system's temp folder.
     const base = (await $.env.get('CLAUDE_CODE_TMPDIR')) || (await $.env.get('TMPDIR')) || '/tmp'

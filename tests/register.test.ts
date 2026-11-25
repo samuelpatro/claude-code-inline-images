@@ -25,7 +25,7 @@ function machine(on: On, runs: Args<'process.run'>[] = [], host: typeof MAC | ty
     // and `identify -ping -format <format> <files>` one line pair per file.
     const sips = e.argv.slice(5).map(file => `${file}\n  pixelWidth: 1200\n  pixelHeight: 800\n`).join('')
     const identify = e.argv.slice(4).map(() => 'pixelWidth: 1200\npixelHeight: 800\n').join('')
-    const stdout = e.argv[0] === '/usr/bin/id' ? `${host.uid}\n` : e.argv.includes('-g') ? sips : e.argv[0] === 'identify' ? identify : '/var/x/\n'
+    const stdout = ['/usr/bin/id', 'id'].includes(e.argv[0] ?? '') ? `${host.uid}\n` : e.argv.includes('-g') ? sips : e.argv[0] === 'identify' ? identify : '/var/x/\n'
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
 }
@@ -141,5 +141,6 @@ test('on Linux a paste is found under TMPDIR and drawn from an ImageMagick thumb
   expect(drawn).toContain('1200×800')
   expect(runs.some(run => run.argv[0] === 'identify' && run.argv.includes(`${LINUX.root}/-Users-x/s1/images/1.png[0]`))).toBe(true)
   expect(runs.some(run => run.argv[0] === 'convert' && run.argv.includes('480x480'))).toBe(true)
-  expect(runs.some(run => run.argv[0] === '/usr/bin/sips' || run.argv[0] === '/usr/bin/getconf')).toBe(false)
+  // Programs come from PATH: NixOS has no /usr/bin/id or /bin/mkdir.
+  expect(runs.some(run => run.argv[0]?.startsWith('/'))).toBe(false)
 })
