@@ -497,7 +497,8 @@ async function poll($: EngineInterface): Promise<void> {
 
 /**
  * Claude Code keeps pastes in <tmp>/claude-<uid>/<project>/<session>/images,
- * <tmp> being /private/tmp or the user's temp folder on macOS, /tmp on Linux,
+ * <tmp> being /private/tmp or the user's temp folder on macOS, CLAUDE_CODE_TMPDIR,
+ * TMPDIR or /tmp on Linux,
  * the project named after the working directory. That place is checked first;
  * every project folder only now and then, for a session started elsewhere.
  */
@@ -524,7 +525,11 @@ async function pasteFolderOf($: EngineInterface, now: number): Promise<string> {
 
 async function pasteRootsOf($: EngineInterface): Promise<string[]> {
   const uid = (await $.process.run(['/usr/bin/id', '-u'])).stdout.trim()
-  if (!isMac) return [`/tmp/claude-${uid}`]
+  if (!isMac) {
+    // Claude Code nests its folder in CLAUDE_CODE_TMPDIR, else the system's temp folder.
+    const base = (await $.env.get('CLAUDE_CODE_TMPDIR')) || (await $.env.get('TMPDIR')) || '/tmp'
+    return [`${base.replace(/\/+$/, '')}/claude-${uid}`]
+  }
   const userTmp = (await $.process.run(['/usr/bin/getconf', 'DARWIN_USER_TEMP_DIR'])).stdout.trim().replace(/\/+$/, '')
   return [`/private/tmp/claude-${uid}`, `${userTmp}/claude-${uid}`]
 }

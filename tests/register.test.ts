@@ -2,7 +2,8 @@ import type { Args, On, RenderElement, RenderInput } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 const MAC = { platform: 'macos', root: '/private/tmp/claude-501', uid: '501' } as const
-const LINUX = { platform: 'linux', root: '/tmp/claude-1000', uid: '1000' } as const
+// TMPDIR as libpam-tmpdir sets it, with the trailing slash it may carry.
+const LINUX = { platform: 'linux', root: '/tmp/user/1000/claude-1000', uid: '1000', tmpdir: '/tmp/user/1000/' } as const
 const FOLDER = `${MAC.root}/-Users-x/s1/images`
 
 /** Answers the engine calls the mod makes: files, sips or ImageMagick, and the paste folder. */
@@ -10,6 +11,7 @@ function machine(on: On, runs: Args<'process.run'>[] = [], host: typeof MAC | ty
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.info', () => ({ value: { transcriptPath: '/tmp/t.jsonl', platform: host.platform } }))
+  on('env.get', ($, e) => ({ value: e.name === 'TMPDIR' && 'tmpdir' in host ? host.tmpdir : undefined }))
   on('ui.invalidate', () => ({ value: undefined }))
   on('session.id', () => ({ value: 's1' }))
   on('fs.list', ($, e) => ({
@@ -114,7 +116,7 @@ test('several images in one tool call are sized by a single sips run', async ($,
   expect(runs.filter(run => run.argv.includes('-Z')).length).toBe(3)
 })
 
-test('on Linux a paste is found under /tmp and drawn from an ImageMagick thumbnail', async ($, on) => {
+test('on Linux a paste is found under TMPDIR and drawn from an ImageMagick thumbnail', async ($, on) => {
   const clock = mock.clock(on, { now: 10_000 })
   const runs: Args<'process.run'>[] = []
   const ROW: RenderElement = { type: 'Text', children: ['> [Image #1] look'] }
