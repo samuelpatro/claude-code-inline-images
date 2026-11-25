@@ -1,17 +1,20 @@
 import type { Args, On, RenderElement, RenderInput } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
-const MAC = { platform: 'macos', root: '/private/tmp/claude-501', uid: '501' } as const
+/** The machine the mod runs on; `missing` names a program that is not installed. */
+type Host = { platform: 'macos' | 'linux'; root: string; uid: string; tmpdir?: string; missing?: string }
+
+const MAC: Host = { platform: 'macos', root: '/private/tmp/claude-501', uid: '501' }
 // TMPDIR as libpam-tmpdir sets it, with the trailing slash it may carry.
-const LINUX = { platform: 'linux', root: '/tmp/user/1000/claude-1000', uid: '1000', tmpdir: '/tmp/user/1000/' } as const
+const LINUX: Host = { platform: 'linux', root: '/tmp/user/1000/claude-1000', uid: '1000', tmpdir: '/tmp/user/1000/' }
 const FOLDER = `${MAC.root}/-Users-x/s1/images`
 
 /** Answers the engine calls the mod makes: files, sips or ImageMagick, and the paste folder. */
-function machine(on: On, runs: Args<'process.run'>[] = [], host: typeof MAC | typeof LINUX = MAC) {
+function machine(on: On, runs: Args<'process.run'>[] = [], host = MAC) {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.info', () => ({ value: { transcriptPath: '/tmp/t.jsonl', platform: host.platform } }))
-  on('env.get', ($, e) => ({ value: e.name === 'TMPDIR' && 'tmpdir' in host ? host.tmpdir : undefined }))
+  on('env.get', ($, e) => ({ value: e.name === 'TMPDIR' ? host.tmpdir : undefined }))
   on('ui.invalidate', () => ({ value: undefined }))
   on('session.id', () => ({ value: 's1' }))
   on('fs.list', ($, e) => ({
@@ -21,6 +24,7 @@ function machine(on: On, runs: Args<'process.run'>[] = [], host: typeof MAC | ty
   on('fs.stat', () => ({ value: { kind: 'file', size: 1000, mtimeMs: 1, isLink: false } }))
   on('process.run', ($, e) => {
     runs.push(e)
+    if (e.argv[0] === host.missing) throw new Error(`${host.missing}: command not found`)
     // `sips -g pixelWidth -g pixelHeight <files>` answers one block per file,
     // and `identify -ping -format <format> <files>` one line pair per file.
     const sips = e.argv.slice(5).map(file => `${file}\n  pixelWidth: 1200\n  pixelHeight: 800\n`).join('')
@@ -143,4 +147,32 @@ test('on Linux a paste is found under TMPDIR and drawn from an ImageMagick thumb
   expect(runs.some(run => run.argv[0] === 'convert' && run.argv.includes('480x480'))).toBe(true)
   // Programs come from PATH: NixOS has no /usr/bin/id or /bin/mkdir.
   expect(runs.some(run => run.argv[0]?.startsWith('/'))).toBe(false)
+})
+
+test('on Linux without ImageMagick a toast says so once', async ($, on) => {
+  const clock = mock.clock(on)
+  const toasts: string[] = []
+  on('ui.render', { component: 'ToolUse' }, () => ({ type: 'Text', children: ['Read(shot.png)'] }))
+  machine(on, [], { ...LINUX, missing: 'identify' })
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  const rowOf = (path: string) =>
+    ({
+      component: 'ToolUse',
+      surface: 'terminal',
+      requestId: path,
+      viewport: { columns: 120, rows: 40 },
+      props: { tool_use_id: path, tool: 'Read', input: { file_path: path }, isRunning: false, isErrored: false, isInterrupted: false },
+    }) as RenderInput<'ToolUse'>
+
+  await $.session.start(START)
+  await $.ui.render(rowOf('/tmp/x/a.png'))
+  await clock.advance(500)
+  await $.ui.render(rowOf('/tmp/x/b.png'))
+  await clock.advance(500)
+
+  expect(toasts.length).toBe(1)
+  expect(toasts[0]).toContain('ImageMagick')
 })

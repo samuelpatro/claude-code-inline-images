@@ -56,6 +56,8 @@ let sessionCwd = ''
 let pasteRoots: string[] | undefined
 // macOS has `sips` and `open`; Linux uses ImageMagick and `xdg-open`.
 let isMac = true
+// Whether the toast about a failed `identify` run was shown.
+let isSizingWarned = false
 // The thumbnail folder, made once.
 let cacheReady: Promise<unknown> | undefined
 // The image paths each tool row names. A draw scans a row's input again only
@@ -331,6 +333,12 @@ async function loadPictures($: EngineInterface, paths: string[]): Promise<void> 
   } catch (error) {
     for (const path of fresh) if (!pictures.has(path)) pictures.set(path, null)
     $.ui.log(`inline-images: ${String(error)}`, { to: 'debug' })
+    // On Linux this is mostly ImageMagick not installed, which `sips` never is
+    // on a Mac: say it once, or no image ever shows and nothing tells why.
+    if (!isMac && !isSizingWarned) {
+      isSizingWarned = true
+      $.ui.toast('Could not size images. Is ImageMagick installed?')
+    }
   } finally {
     for (const path of fresh) loading.delete(path)
   }
