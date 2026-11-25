@@ -8,7 +8,8 @@ type Cells = { columns: number; rows: number }
 const MARKER = /\[Image #(\d+)\]/g
 const IMAGE_PATH = /\/[^\s'"`<>|;]+\.(?:png|jpe?g|gif|webp|heic|tiff?|bmp)\b/gi
 const CMUX = '/Applications/cmux.app/Contents/Resources/bin/cmux'
-const CACHE = '/private/tmp/inline-images-cache'
+const MAC_CACHE = '/private/tmp/inline-images-cache'
+const LINUX_CACHE = '/tmp/inline-images-cache'
 
 // Terminal cells are about twice as tall as they are wide, and ~8 px wide.
 const CELL_ASPECT = 0.5
@@ -53,6 +54,8 @@ let lastScan = Number.NEGATIVE_INFINITY
 let sessionCwd = ''
 // The folders Claude Code keeps pastes under: the same for the whole session.
 let pasteRoots: string[] | undefined
+// macOS has `sips` and `open`; Linux uses ImageMagick and `xdg-open`.
+let isMac = true
 // The thumbnail folder, made once.
 let cacheReady: Promise<unknown> | undefined
 // The image paths each tool row names. A draw scans a row's input again only
@@ -70,6 +73,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     sessionCwd = e.cwd
+    isMac = (await $.session.info()).platform === 'macos'
     $.clock.every(POLL_MS, () => void poll($))
     return result
   })
@@ -335,16 +339,22 @@ async function loadPictures($: EngineInterface, paths: string[]): Promise<void> 
 
 type Size = { width: number; height: number }
 
-/** The small PNG copy to draw for an image, made once with macOS `sips`. */
+/** The small PNG copy to draw for an image, made once with `sips` on macOS, ImageMagick on Linux. */
 async function pictureOf($: EngineInterface, path: string, mtimeMs: number, size: Size): Promise<Picture | null> {
   const longSide = Math.max(size.width, size.height)
   if (/\.png$/i.test(path) && longSide <= THUMB_PX) return { path, thumb: path, ...size }
-  const thumb = `${CACHE}/${hashOf(`${path}:${mtimeMs}`)}.png`
+  const cache = isMac ? MAC_CACHE : LINUX_CACHE
+  const thumb = `${cache}/${hashOf(`${path}:${mtimeMs}`)}.png`
   if (!(await $.fs.exists(thumb))) {
-    cacheReady ??= $.process.run(['/bin/mkdir', '-p', CACHE])
+    cacheReady ??= $.process.run(['/bin/mkdir', '-p', cache])
     await cacheReady
-    // `sips -Z` also scales up, so a small image keeps its own size.
-    const made = await $.process.run(['/usr/bin/sips', '-s', 'format', 'png', '-Z', String(Math.min(THUMB_PX, longSide)), path, '--out', thumb])
+    // `sips -Z` also scales up, so a small image keeps its own size. `[0]` is
+    // the first frame, so an animated GIF makes one PNG and not one per frame.
+    const side = String(Math.min(THUMB_PX, longSide))
+    const argv = isMac
+      ? ['/usr/bin/sips', '-s', 'format', 'png', '-Z', side, path, '--out', thumb]
+      : ['convert', `${path}[0]`, '-thumbnail', `${side}x${side}`, thumb]
+    const made = await $.process.run(argv)
     if (made.exitCode !== 0) {
       cacheReady = undefined // the folder may have been cleaned away
       return null
@@ -353,10 +363,14 @@ async function pictureOf($: EngineInterface, path: string, mtimeMs: number, size
   return { path, thumb, ...size }
 }
 
-/** The pixel sizes of these image files, from one `sips` run; undefined for a file it cannot read. */
+/** The pixel sizes of these image files, from one `sips` or `identify` run; undefined for a file it cannot read. */
 async function sizesOf($: EngineInterface, files: string[]): Promise<(Size | undefined)[]> {
   if (files.length === 0) return []
-  const { exitCode, stdout } = await $.process.run(['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', ...files])
+  // `identify` prints the sizes the way `sips` does, so one pattern reads both.
+  const argv = isMac
+    ? ['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', ...files]
+    : ['identify', '-ping', '-format', 'pixelWidth: %w\npixelHeight: %h\n', ...files.map(file => `${file}[0]`)]
+  const { exitCode, stdout } = await $.process.run(argv)
   const found = [...stdout.matchAll(/pixelWidth: (\S+)\s+pixelHeight: (\S+)/g)]
   if (exitCode !== 0 || found.length !== files.length) {
     // `sips` leaves out a file that went missing, so the answers no longer
@@ -384,13 +398,13 @@ function hashOf(text: string): string {
  * Opens an image. In cmux, a click puts it in the split beside Claude: the
  * workspace's other pane, or a new browser split on the right when there is
  * none (later clicks reuse it). The Open button, and anywhere outside cmux,
- * hand it to the Mac's default app.
+ * hand it to the default app: `open` on macOS, `xdg-open` on Linux.
  */
 async function openFile($: EngineInterface, path: string, inCmux: boolean): Promise<void> {
   try {
     const clicked = inCmux ? await clickedPane($) : undefined
     if (!clicked) {
-      const { exitCode, stderr } = await $.process.run(['/usr/bin/open', path])
+      const { exitCode, stderr } = await $.process.run([isMac ? '/usr/bin/open' : 'xdg-open', path])
       if (exitCode !== 0) $.ui.toast(`Could not open ${path.slice(path.lastIndexOf('/') + 1)}: ${stderr.trim()}`)
       return
     }
@@ -483,6 +497,7 @@ async function poll($: EngineInterface): Promise<void> {
 
 /**
  * Claude Code keeps pastes in <tmp>/claude-<uid>/<project>/<session>/images,
+ * <tmp> being /private/tmp or the user's temp folder on macOS, /tmp on Linux,
  * the project named after the working directory. That place is checked first;
  * every project folder only now and then, for a session started elsewhere.
  */
@@ -509,6 +524,7 @@ async function pasteFolderOf($: EngineInterface, now: number): Promise<string> {
 
 async function pasteRootsOf($: EngineInterface): Promise<string[]> {
   const uid = (await $.process.run(['/usr/bin/id', '-u'])).stdout.trim()
+  if (!isMac) return [`/tmp/claude-${uid}`]
   const userTmp = (await $.process.run(['/usr/bin/getconf', 'DARWIN_USER_TEMP_DIR'])).stdout.trim().replace(/\/+$/, '')
   return [`/private/tmp/claude-${uid}`, `${userTmp}/claude-${uid}`]
 }

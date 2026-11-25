@@ -1,24 +1,29 @@
 import type { Args, On, RenderElement, RenderInput } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
-const FOLDER = '/private/tmp/claude-501/-Users-x/s1/images'
+const MAC = { platform: 'macos', root: '/private/tmp/claude-501', uid: '501' } as const
+const LINUX = { platform: 'linux', root: '/tmp/claude-1000', uid: '1000' } as const
+const FOLDER = `${MAC.root}/-Users-x/s1/images`
 
-/** Answers the engine calls the mod makes: files, sips and the paste folder. */
-function machine(on: On, runs: Args<'process.run'>[] = []) {
+/** Answers the engine calls the mod makes: files, sips or ImageMagick, and the paste folder. */
+function machine(on: On, runs: Args<'process.run'>[] = [], host: typeof MAC | typeof LINUX = MAC) {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.info', () => ({ value: { transcriptPath: '/tmp/t.jsonl', platform: host.platform } }))
   on('ui.invalidate', () => ({ value: undefined }))
   on('session.id', () => ({ value: 's1' }))
   on('fs.list', ($, e) => ({
-    value: e.path === '/private/tmp/claude-501' ? [{ name: '-Users-x', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] : [],
+    value: e.path === host.root ? [{ name: '-Users-x', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] : [],
   }))
-  on('fs.exists', ($, e) => ({ value: e.path === FOLDER }))
+  on('fs.exists', ($, e) => ({ value: e.path === `${host.root}/-Users-x/s1/images` }))
   on('fs.stat', () => ({ value: { kind: 'file', size: 1000, mtimeMs: 1, isLink: false } }))
   on('process.run', ($, e) => {
     runs.push(e)
-    // `sips -g pixelWidth -g pixelHeight <files>` answers one block per file.
-    const sizes = e.argv.slice(5).map(file => `${file}\n  pixelWidth: 1200\n  pixelHeight: 800\n`).join('')
-    const stdout = e.argv[0] === '/usr/bin/id' ? '501\n' : e.argv.includes('-g') ? sizes : '/var/x/\n'
+    // `sips -g pixelWidth -g pixelHeight <files>` answers one block per file,
+    // and `identify -ping -format <format> <files>` one line pair per file.
+    const sips = e.argv.slice(5).map(file => `${file}\n  pixelWidth: 1200\n  pixelHeight: 800\n`).join('')
+    const identify = e.argv.slice(4).map(() => 'pixelWidth: 1200\npixelHeight: 800\n').join('')
+    const stdout = e.argv[0] === '/usr/bin/id' ? `${host.uid}\n` : e.argv.includes('-g') ? sips : e.argv[0] === 'identify' ? identify : '/var/x/\n'
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
 }
@@ -107,4 +112,32 @@ test('several images in one tool call are sized by a single sips run', async ($,
   for (const name of ['a.png', 'b.jpg', 'c.webp']) expect(drawn).toContain(`"path":"/tmp/y/${name}"`)
   expect(runs.filter(run => run.argv.includes('-g')).length).toBe(1)
   expect(runs.filter(run => run.argv.includes('-Z')).length).toBe(3)
+})
+
+test('on Linux a paste is found under /tmp and drawn from an ImageMagick thumbnail', async ($, on) => {
+  const clock = mock.clock(on, { now: 10_000 })
+  const runs: Args<'process.run'>[] = []
+  const ROW: RenderElement = { type: 'Text', children: ['> [Image #1] look'] }
+  on('ui.render', { component: 'UserMessage' }, () => ROW)
+  machine(on, runs, LINUX)
+  const input = {
+    component: 'UserMessage',
+    surface: 'terminal',
+    requestId: 'm1',
+    viewport: { columns: 120, rows: 40 },
+    props: { text: '[Image #1] look', origin: { kind: 'composer' }, isExpanded: false },
+  } as RenderInput<'UserMessage'>
+
+  await $.session.start(START)
+  await $.ui.render(input)
+  await clock.advance(500)
+  await $.ui.render(input)
+  await clock.advance(500)
+  const drawn = JSON.stringify(await $.ui.render(input))
+  expect(drawn).toContain('"file":"/tmp/inline-images-cache/')
+  expect(drawn).toContain(`"path":"${LINUX.root}/-Users-x/s1/images/1.png"`)
+  expect(drawn).toContain('1200×800')
+  expect(runs.some(run => run.argv[0] === 'identify' && run.argv.includes(`${LINUX.root}/-Users-x/s1/images/1.png[0]`))).toBe(true)
+  expect(runs.some(run => run.argv[0] === 'convert' && run.argv.includes('480x480'))).toBe(true)
+  expect(runs.some(run => run.argv[0] === '/usr/bin/sips' || run.argv[0] === '/usr/bin/getconf')).toBe(false)
 })
